@@ -1,4 +1,5 @@
 export 'src/models/aadhaar_details.dart';
+export 'src/models/ocr_language.dart';
 export 'src/models/cheque_details.dart';
 export 'src/models/document_details.dart';
 export 'src/models/driving_license_details.dart';

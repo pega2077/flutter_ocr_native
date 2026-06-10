@@ -43,6 +43,11 @@ class OcrMethodChannel implements OcrPlatformInterface {
   }
 
   @override
+  Future<void> setLanguage(String languageTag) async {
+    await _channel.invokeMethod('setLanguage', {'languageTag': languageTag});
+  }
+
+  @override
   Future<void> dispose() async {
     await _channel.invokeMethod('dispose');
   }

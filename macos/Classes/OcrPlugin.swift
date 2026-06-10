@@ -5,6 +5,7 @@ import Vision
 public class OcrPlugin: NSObject, FlutterPlugin {
     private let englishPattern = try! NSRegularExpression(pattern: "[A-Za-z0-9]")
     private let aadhaarPattern = try! NSRegularExpression(pattern: "(\\d{4})[\\s\\-]*(\\d{4})[\\s\\-]*(\\d{4})")
+    private var languageMode: String?
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "com.flutter_ocr_native/text_recognition", binaryMessenger: registrar.messenger)
@@ -242,6 +243,14 @@ public class OcrPlugin: NSObject, FlutterPlugin {
                 }
             }
 
+        case "setLanguage":
+            guard let languageTag = args?["languageTag"] as? String, !languageTag.isEmpty else {
+                result(FlutterError(code: "INVALID_ARG", message: "languageTag required", details: nil))
+                return
+            }
+            languageMode = languageTag
+            result(nil)
+
         case "dispose":
             result(nil)
 
@@ -361,7 +370,37 @@ public class OcrPlugin: NSObject, FlutterPlugin {
         return true
     }
 
+    private func recognitionLanguages() -> [String] {
+        if let mode = languageMode {
+            if mode == "system" {
+                return Array(Locale.preferredLanguages.prefix(3))
+            }
+            return [mode]
+        }
+        return ["en-US"]
+    }
+
+    private func shouldFilterLatinOnly() -> Bool {
+        guard let mode = languageMode else { return true }
+        if mode == "system" {
+            return (Locale.preferredLanguages.first ?? "en-US").hasPrefix("en")
+        }
+        return mode.hasPrefix("en")
+    }
+
+    private func recognizedLanguageTag() -> String {
+        if let mode = languageMode {
+            if mode == "system" {
+                return Locale.preferredLanguages.first ?? "en-US"
+            }
+            return mode
+        }
+        return "en-US"
+    }
+
     private func recognizeText(from image: CGImage, result: @escaping FlutterResult) {
+        let filterLatinOnly = shouldFilterLatinOnly()
+        let languageTag = recognizedLanguageTag()
         let request = VNRecognizeTextRequest { [weak self] request, error in
             guard let self = self else { return }
 
@@ -381,8 +420,9 @@ public class OcrPlugin: NSObject, FlutterPlugin {
 
             for observation in observations {
                 guard let candidate = observation.topCandidates(1).first else { continue }
-                let text = candidate.string
-                guard self.isEnglish(text) else { continue }
+                let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.isEmpty { continue }
+                if filterLatinOnly && !self.isEnglish(text) { continue }
 
                 let box = observation.boundingBox
                 let boundingBox: [String: Any] = [
@@ -408,6 +448,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
                 blocks.append([
                     "text": text,
                     "boundingBox": boundingBox,
+                    "recognizedLanguage": languageTag,
                     "lines": [line]
                 ])
             }
@@ -426,7 +467,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
 
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
-        request.recognitionLanguages = ["en-US"]
+        request.recognitionLanguages = recognitionLanguages()
 
         let handler = VNImageRequestHandler(cgImage: image, options: [:])
         DispatchQueue.global(qos: .userInitiated).async {

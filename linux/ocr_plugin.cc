@@ -18,6 +18,7 @@ struct _FlutterOcrNativePlugin {
   GObject parent_instance;
   FlMethodChannel* channel;
   tesseract::TessBaseAPI* tess;
+  gchar* language_tag;
 };
 
 G_DEFINE_TYPE(FlutterOcrNativePlugin, flutter_ocr_native_plugin, g_object_get_type())
@@ -64,6 +65,58 @@ static bool is_english(const std::string& text) {
   return std::regex_search(text, pattern);
 }
 
+static bool starts_with(const char* value, const char* prefix) {
+  if (!value || !prefix) return false;
+  return strncmp(value, prefix, strlen(prefix)) == 0;
+}
+
+static std::string map_language_tag(const char* tag) {
+  if (!tag || strcmp(tag, "system") == 0) {
+    const char* lang = getenv("LANG");
+    if (lang) {
+      if (starts_with(lang, "zh_CN") || starts_with(lang, "zh_Hans")) return "chi_sim";
+      if (starts_with(lang, "zh_TW") || starts_with(lang, "zh_Hant")) return "chi_tra";
+      if (starts_with(lang, "zh")) return "chi_sim";
+      if (starts_with(lang, "ja")) return "jpn";
+      if (starts_with(lang, "ko")) return "kor";
+    }
+    return "eng";
+  }
+  if (starts_with(tag, "zh-Hans") || strcmp(tag, "zh-CN") == 0) return "chi_sim";
+  if (starts_with(tag, "zh-Hant") || strcmp(tag, "zh-TW") == 0) return "chi_tra";
+  if (starts_with(tag, "zh")) return "chi_sim";
+  if (starts_with(tag, "ja")) return "jpn";
+  if (starts_with(tag, "ko")) return "kor";
+  if (starts_with(tag, "en")) return "eng";
+  return "eng";
+}
+
+static bool should_filter_latin_only(const gchar* language_tag) {
+  if (!language_tag) return true;
+  if (strcmp(language_tag, "system") == 0) {
+    const char* lang = getenv("LANG");
+    return !lang || starts_with(lang, "en");
+  }
+  return starts_with(language_tag, "en");
+}
+
+static bool init_tesseract(FlutterOcrNativePlugin* self, const char* requested_tag) {
+  if (self->tess) {
+    self->tess->End();
+    delete self->tess;
+    self->tess = nullptr;
+  }
+
+  self->tess = new tesseract::TessBaseAPI();
+  const std::string tess_lang = map_language_tag(requested_tag);
+  if (self->tess->Init(nullptr, tess_lang.c_str()) != 0) {
+    delete self->tess;
+    self->tess = nullptr;
+    return false;
+  }
+  return true;
+}
+
 // OCR recognition
 static FlMethodResponse* recognize(FlutterOcrNativePlugin* self, const uint8_t* data, size_t len) {
   Pix* pix = pix_from_bytes(data, len);
@@ -85,7 +138,7 @@ static FlMethodResponse* recognize(FlutterOcrNativePlugin* self, const uint8_t* 
       std::string line_text(word);
       delete[] word;
 
-      if (!is_english(line_text)) continue;
+      if (should_filter_latin_only(self->language_tag) && !is_english(line_text)) continue;
 
       // Get bounding box
       int x1, y1, x2, y2;
@@ -280,6 +333,19 @@ static void method_call_handler(FlMethodChannel* channel, FlMethodCall* method_c
     const uint8_t* data = fl_value_get_uint8_list(bytes_val);
     size_t len = fl_value_get_length(bytes_val);
     response = compress_image(data, len, quality);
+  } else if (strcmp(method, "setLanguage") == 0) {
+    const char* language_tag = fl_value_get_string(fl_value_lookup_string(args, "languageTag"));
+    if (!language_tag || strlen(language_tag) == 0) {
+      response = FL_METHOD_RESPONSE(
+          fl_method_error_response_new("INVALID_ARG", "languageTag is required", nullptr));
+    } else if (!init_tesseract(self, language_tag)) {
+      response = FL_METHOD_RESPONSE(
+          fl_method_error_response_new("LANGUAGE_FAILED", "Could not initialize OCR language", nullptr));
+    } else {
+      g_free(self->language_tag);
+      self->language_tag = g_strdup(language_tag);
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_null()));
+    }
   } else if (strcmp(method, "dispose") == 0) {
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_null()));
   } else if (strcmp(method, "renderPdfPage") == 0) {
@@ -303,6 +369,8 @@ static void flutter_ocr_native_plugin_dispose(GObject* object) {
     delete self->tess;
     self->tess = nullptr;
   }
+  g_free(self->language_tag);
+  self->language_tag = nullptr;
   g_clear_object(&self->channel);
   G_OBJECT_CLASS(flutter_ocr_native_plugin_parent_class)->dispose(object);
 }
@@ -312,11 +380,8 @@ static void flutter_ocr_native_plugin_class_init(FlutterOcrNativePluginClass* kl
 }
 
 static void flutter_ocr_native_plugin_init(FlutterOcrNativePlugin* self) {
-  self->tess = new tesseract::TessBaseAPI();
-  if (self->tess->Init(nullptr, "eng") != 0) {
-    delete self->tess;
-    self->tess = nullptr;
-  }
+  self->language_tag = nullptr;
+  init_tesseract(self, nullptr);
 }
 
 void flutter_ocr_native_plugin_register_with_registrar(FlPluginRegistrar* registrar) {

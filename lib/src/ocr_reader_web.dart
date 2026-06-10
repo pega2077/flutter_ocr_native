@@ -32,7 +32,11 @@ class OcrReader {
     return maskAadhaar ? resolved.maskAadhaar() : resolved;
   }
 
-  /// Recognize English text from an image URL/path.
+  /// Configures the OCR language for subsequent recognition calls.
+  Future<void> setLanguage(String languageTag) =>
+      _platform.setLanguage(languageTag);
+
+  /// Recognize text from an image URL/path.
   Future<OcrResult> readFromPath(String imagePath) {
     if (imagePath.trim().isEmpty) {
       throw ArgumentError('Image path cannot be empty');
@@ -40,7 +44,7 @@ class OcrReader {
     return _process(_platform.recognizeFromPath(imagePath));
   }
 
-  /// Recognize English text from raw image bytes.
+  /// Recognize text from raw image bytes.
   Future<OcrResult> readFromBytes(Uint8List bytes) {
     if (bytes.isEmpty) {
       throw ArgumentError('Image bytes cannot be empty');

@@ -75,6 +75,15 @@ class WinRtWorker {
   // Must only be called from tasks executing on the worker thread.
   ocr::OcrEngine ActiveEngine() const { return ocr_engine_; }
 
+  std::string LanguageTag() {
+    WaitUntilReady();
+    return language_tag_;
+  }
+
+  void SetLanguage(const std::string& language_tag) {
+    Run([&, language_tag]() { RebuildEngine(language_tag); });
+  }
+
  private:
   WinRtWorker() : thread_([this] { ThreadMain(); }) {}
 
@@ -105,14 +114,43 @@ class WinRtWorker {
     ready_cv_.wait(lock, [this] { return engine_ready_; });
   }
 
+  static std::wstring Utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) {
+      return {};
+    }
+    const int size =
+        MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+    if (size <= 0) {
+      return {};
+    }
+    std::wstring wide(size - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, wide.data(), size);
+    return wide;
+  }
+
+  void RebuildEngine(const std::string& requested) {
+    ocr_engine_ = nullptr;
+    if (requested.empty() || requested == "system") {
+      ocr_engine_ = ocr::OcrEngine::TryCreateFromUserProfileLanguages();
+    } else {
+      ocr_engine_ = ocr::OcrEngine::TryCreateFromLanguage(
+          globalization::Language(Utf8ToWide(requested)));
+    }
+    if (!ocr_engine_) {
+      ocr_engine_ = ocr::OcrEngine::TryCreateFromLanguage(
+          globalization::Language(L"en-US"));
+    }
+    if (ocr_engine_) {
+      language_tag_ =
+          winrt::to_string(ocr_engine_.RecognizerLanguage().LanguageTag());
+    } else {
+      language_tag_ = "en-US";
+    }
+  }
+
   void ThreadMain() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
-
-    ocr_engine_ = ocr::OcrEngine::TryCreateFromLanguage(
-        globalization::Language(L"en-US"));
-    if (!ocr_engine_) {
-      ocr_engine_ = ocr::OcrEngine::TryCreateFromUserProfileLanguages();
-    }
+    RebuildEngine("system");
 
     {
       std::lock_guard lock(mutex_);
@@ -143,6 +181,7 @@ class WinRtWorker {
   bool stopping_ = false;
   bool engine_ready_ = false;
   ocr::OcrEngine ocr_engine_{nullptr};
+  std::string language_tag_{"en-US"};
 };
 
 class FlutterOcrNativePlugin : public flutter::Plugin {
@@ -187,7 +226,8 @@ class FlutterOcrNativePlugin : public flutter::Plugin {
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
   flutter::EncodableMap ProcessOcrResult(const ocr::OcrResult& ocr_result,
-                                          const std::vector<uint8_t>& image_bytes);
+                                          const std::vector<uint8_t>& image_bytes,
+                                          const std::string& language_tag);
 
   std::vector<uint8_t> MaskAadhaarOnImage(const std::vector<uint8_t>& image_bytes,
                                            const ocr::OcrResult& ocr_result);
@@ -268,6 +308,29 @@ void FlutterOcrNativePlugin::HandleMethodCall(
     auto bytes = std::get<std::vector<uint8_t>>(bytes_it->second);
     int quality = quality_it != args->end() ? std::get<int>(quality_it->second) : 80;
     CompressImage(bytes, quality, std::move(result));
+  } else if (method == "setLanguage") {
+    if (!args) {
+      result->Error("INVALID_ARG", "Arguments required");
+      return;
+    }
+    auto it = args->find(flutter::EncodableValue("languageTag"));
+    if (it == args->end()) {
+      result->Error("INVALID_ARG", "languageTag required");
+      return;
+    }
+    auto language_tag = std::get<std::string>(it->second);
+    if (language_tag.empty()) {
+      result->Error("INVALID_ARG", "languageTag cannot be empty");
+      return;
+    }
+    try {
+      WinRtWorker::Instance().SetLanguage(language_tag);
+      result->Success(flutter::EncodableValue());
+    } catch (const winrt::hresult_error& e) {
+      result->Error("LANGUAGE_FAILED", winrt::to_string(e.message()));
+    } catch (const std::exception& e) {
+      result->Error("LANGUAGE_FAILED", e.what());
+    }
   } else if (method == "dispose") {
     result->Success(flutter::EncodableValue());
   } else if (method == "renderPdfPage") {
@@ -338,7 +401,7 @@ void FlutterOcrNativePlugin::RecognizeFromBytes(
       }
 
       auto ocr_result = engine.RecognizeAsync(bitmap).get();
-      return ProcessOcrResult(ocr_result, bytes);
+      return ProcessOcrResult(ocr_result, bytes, worker.LanguageTag());
     });
     result->Success(flutter::EncodableValue(response));
   } catch (const winrt::hresult_error& e) {
@@ -348,11 +411,17 @@ void FlutterOcrNativePlugin::RecognizeFromBytes(
   }
 }
 
+bool UsesCompactWordSpacing(const std::string& language_tag) {
+  return language_tag.rfind("zh", 0) == 0 || language_tag.rfind("ja", 0) == 0 ||
+         language_tag.rfind("ko", 0) == 0;
+}
+
 flutter::EncodableMap FlutterOcrNativePlugin::ProcessOcrResult(
-    const ocr::OcrResult& ocr_result, const std::vector<uint8_t>& image_bytes) {
+    const ocr::OcrResult& ocr_result, const std::vector<uint8_t>& image_bytes,
+    const std::string& language_tag) {
   std::string full_text;
   flutter::EncodableList blocks;
-  std::regex english_pattern("[A-Za-z0-9]");
+  const bool compact_spacing = UsesCompactWordSpacing(language_tag);
 
   for (const auto& line : ocr_result.Lines()) {
     std::string line_text;
@@ -362,7 +431,7 @@ flutter::EncodableMap FlutterOcrNativePlugin::ProcessOcrResult(
 
     for (const auto& word : line.Words()) {
       auto text = winrt::to_string(word.Text());
-      if (!std::regex_search(text, english_pattern)) continue;
+      if (text.empty()) continue;
 
       auto rect = word.BoundingRect();
       flutter::EncodableMap bbox;
@@ -377,7 +446,9 @@ flutter::EncodableMap FlutterOcrNativePlugin::ProcessOcrResult(
       element[flutter::EncodableValue("confidence")] = flutter::EncodableValue(0.9);
 
       elements.push_back(flutter::EncodableValue(element));
-      if (!line_text.empty()) line_text += " ";
+      if (!compact_spacing && !line_text.empty()) {
+        line_text += " ";
+      }
       line_text += text;
       total_confidence += 0.9;
       word_count++;
@@ -403,7 +474,8 @@ flutter::EncodableMap FlutterOcrNativePlugin::ProcessOcrResult(
     flutter::EncodableMap block;
     block[flutter::EncodableValue("text")] = flutter::EncodableValue(line_text);
     block[flutter::EncodableValue("boundingBox")] = flutter::EncodableValue(line_bbox);
-    block[flutter::EncodableValue("recognizedLanguage")] = flutter::EncodableValue("en");
+    block[flutter::EncodableValue("recognizedLanguage")] =
+        flutter::EncodableValue(language_tag);
     block[flutter::EncodableValue("lines")] = flutter::EncodableValue(flutter::EncodableList{flutter::EncodableValue(line_map)});
 
     blocks.push_back(flutter::EncodableValue(block));

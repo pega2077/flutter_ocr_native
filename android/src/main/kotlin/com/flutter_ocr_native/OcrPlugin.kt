@@ -17,7 +17,12 @@ import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
+import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
+import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.util.Locale
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -29,6 +34,7 @@ class OcrPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private lateinit var channel: MethodChannel
     private lateinit var context: Context
     private var recognizer: TextRecognizer? = null
+    private var languageMode: String? = null
 
     private val englishPattern = Regex("[A-Za-z0-9]")
     // Matches Aadhaar: 4 digits, optional separator, 4 digits, optional separator, 4 digits
@@ -38,7 +44,7 @@ class OcrPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         context = binding.applicationContext
         channel = MethodChannel(binding.binaryMessenger, "com.flutter_ocr_native/text_recognition")
         channel.setMethodCallHandler(this)
-        recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        recognizer = createRecognizer(null)
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -320,6 +326,16 @@ class OcrPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                         result.success(bytes)
                     }
             }
+            "setLanguage" -> {
+                val languageTag = call.argument<String>("languageTag")
+                if (languageTag.isNullOrBlank()) {
+                    result.error("INVALID_ARG", "languageTag is required", null)
+                    return
+                }
+                languageMode = languageTag
+                rebuildRecognizer()
+                result.success(null)
+            }
             "dispose" -> {
                 recognizer?.close()
                 recognizer = null
@@ -348,12 +364,60 @@ class OcrPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
     }
 
+    private fun createRecognizer(languageTag: String?): TextRecognizer {
+        val effectiveTag = when (languageTag) {
+            null -> return TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            "system" -> Locale.getDefault().toLanguageTag()
+            else -> languageTag
+        }
+        return when {
+            effectiveTag.startsWith("zh", ignoreCase = true) ->
+                TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+            effectiveTag.startsWith("ja", ignoreCase = true) ->
+                TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
+            effectiveTag.startsWith("ko", ignoreCase = true) ->
+                TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+            effectiveTag.startsWith("hi", ignoreCase = true) ||
+                effectiveTag.startsWith("mr", ignoreCase = true) ||
+                effectiveTag.startsWith("ne", ignoreCase = true) ->
+                TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
+            else -> TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        }
+    }
+
+    private fun rebuildRecognizer() {
+        recognizer?.close()
+        recognizer = createRecognizer(languageMode)
+    }
+
+    private fun shouldFilterLatinOnly(): Boolean {
+        val tag = languageMode ?: return true
+        if (tag == "system") {
+            return Locale.getDefault().language == "en"
+        }
+        return tag.startsWith("en", ignoreCase = true)
+    }
+
+    private fun usesCompactWordSpacing(): Boolean {
+        val tag = when (languageMode) {
+            null -> return false
+            "system" -> Locale.getDefault().language
+            else -> tagPrefix(languageMode!!)
+        }
+        return tag == "zh" || tag == "ja" || tag == "ko"
+    }
+
+    private fun tagPrefix(languageTag: String): String =
+        languageTag.substringBefore('-').lowercase(Locale.ROOT)
+
     private fun processImage(image: InputImage, bitmap: Bitmap, result: MethodChannel.Result) {
         val rec = recognizer
         if (rec == null) {
             result.error("NOT_INITIALIZED", "Recognizer not initialized", null)
             return
         }
+        val filterLatinOnly = shouldFilterLatinOnly()
+        val compactSpacing = usesCompactWordSpacing()
 
         rec.process(image)
             .addOnSuccessListener { visionText ->
@@ -364,17 +428,26 @@ class OcrPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
                     for (line in block.lines) {
                         val filteredElements = line.elements
-                            .filter { isEnglish(it.text) }
-                            .map { element ->
+                            .mapNotNull { element ->
+                                val text = if (filterLatinOnly) {
+                                    if (!isEnglish(element.text)) return@mapNotNull null
+                                    extractEnglish(element.text)
+                                } else {
+                                    element.text.trim()
+                                }
+                                if (text.isEmpty()) return@mapNotNull null
                                 mapOf(
-                                    "text" to extractEnglish(element.text),
+                                    "text" to text,
                                     "boundingBox" to element.boundingBox?.let { rectToMap(it) },
                                     "confidence" to element.confidence
                                 )
                             }
 
                         if (filteredElements.isNotEmpty()) {
-                            val lineText = filteredElements.joinToString(" ") { it["text"] as String }
+                            val separator = if (compactSpacing) "" else " "
+                            val lineText = filteredElements.joinToString(separator) {
+                                it["text"] as String
+                            }
                             filteredLines.add(mapOf(
                                 "text" to lineText,
                                 "boundingBox" to line.boundingBox?.let { rectToMap(it) },

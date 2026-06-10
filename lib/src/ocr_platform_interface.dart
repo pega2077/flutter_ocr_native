@@ -7,5 +7,6 @@ abstract class OcrPlatformInterface {
   Future<OcrResult> recognizeFromBytes(Uint8List bytes);
   Future<Uint8List?> renderPdfPage(Uint8List pdfBytes, {int page = 0, double scale = 2.0});
   Future<int> getPdfPageCount(Uint8List pdfBytes);
+  Future<void> setLanguage(String languageTag);
   Future<void> dispose();
 }

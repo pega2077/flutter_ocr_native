@@ -13,6 +13,8 @@ external JSObject? get _tesseract;
 class FlutterOcrNativeWeb implements OcrPlatformInterface {
   static void registerWith([Object? _]) {}
 
+  String _tesseractLanguage = 'eng';
+
   @override
   Future<OcrResult> recognizeFromPath(String imagePath) async {
     if (imagePath.trim().isEmpty) {
@@ -44,6 +46,11 @@ class FlutterOcrNativeWeb implements OcrPlatformInterface {
   Future<int> getPdfPageCount(Uint8List pdfBytes) async => 0;
 
   @override
+  Future<void> setLanguage(String languageTag) async {
+    _tesseractLanguage = _mapLanguageTag(languageTag);
+  }
+
+  @override
   Future<void> dispose() async {}
 
   Future<dynamic> _recognize(dynamic imageSource) async {
@@ -65,7 +72,7 @@ class FlutterOcrNativeWeb implements OcrPlatformInterface {
     final rawPromise = recognize.callAsFunction(
       tesseract,
       imageSource.toString().toJS,
-      'eng'.toJS,
+      _tesseractLanguage.toJS,
       _recognizeOptions(),
     );
     final promise = _requireJsPromise(
@@ -86,6 +93,22 @@ class FlutterOcrNativeWeb implements OcrPlatformInterface {
       'isPrinted': true,
       'blocks': blocks,
     });
+  }
+
+  String _mapLanguageTag(String languageTag) {
+    if (languageTag == 'system') return 'eng';
+    final normalized = languageTag.toLowerCase();
+    if (normalized.startsWith('zh-hans') || normalized == 'zh-cn') {
+      return 'chi_sim';
+    }
+    if (normalized.startsWith('zh-hant') || normalized.startsWith('zh-tw')) {
+      return 'chi_tra';
+    }
+    if (normalized.startsWith('zh')) return 'chi_sim';
+    if (normalized.startsWith('ja')) return 'jpn';
+    if (normalized.startsWith('ko')) return 'kor';
+    if (normalized.startsWith('en')) return 'eng';
+    return 'eng';
   }
 
   JSObject _recognizeOptions() {

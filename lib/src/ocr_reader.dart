@@ -33,8 +33,15 @@ class OcrReader {
     return maskAadhaar ? r.maskAadhaar() : r;
   }
 
-  /// Recognize English text from an image file path.
-  /// Non-English text (Tamil, Hindi, etc.) is automatically filtered out.
+  /// Configures the OCR language for subsequent recognition calls.
+  ///
+  /// [languageTag] is a BCP-47 tag such as [OcrLanguage.english] or
+  /// [OcrLanguage.chineseSimplified]. Use [OcrLanguage.system] to follow
+  /// the device language.
+  Future<void> setLanguage(String languageTag) =>
+      _platform.setLanguage(languageTag);
+
+  /// Recognize text from an image file path.
   Future<OcrResult> readFromPath(String imagePath) {
     if (!File(imagePath).existsSync()) {
       throw ArgumentError('File not found: $imagePath');
@@ -42,13 +49,13 @@ class OcrReader {
     return _process(_platform.recognizeFromPath(imagePath));
   }
 
-  /// Recognize English text from raw image bytes.
+  /// Recognize text from raw image bytes.
   Future<OcrResult> readFromBytes(Uint8List bytes) {
     if (bytes.isEmpty) throw ArgumentError('Image bytes cannot be empty');
     return _process(_platform.recognizeFromBytes(bytes));
   }
 
-  /// Recognize English text from a [File].
+  /// Recognize text from a [File].
   Future<OcrResult> readFromFile(File file) => readFromPath(file.path);
 
   /// Recognize text from a PDF file (renders page to image first).
