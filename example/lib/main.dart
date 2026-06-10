@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -8,9 +6,10 @@ import 'package:image_picker/image_picker.dart';
 
 void main() => runApp(const OcrExampleApp());
 
-bool get isMobile => !kIsWeb && (Platform.isAndroid || Platform.isIOS);
-bool get isDesktop =>
-    !kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+bool get isMobile =>
+    !kIsWeb &&
+    (defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS);
 
 class OcrExampleApp extends StatelessWidget {
   const OcrExampleApp({super.key});
@@ -37,7 +36,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
   final _reader = OcrReader(validateDocument: true, maskAadhaar: true);
   final _picker = ImagePicker();
 
-  File? _imageFile;
+  String? _imageName;
   Uint8List? _processedBytes;
   OcrResult? _result;
   DocumentDetails? _details;
@@ -57,7 +56,13 @@ class _OcrHomePageState extends State<OcrHomePage> {
     final proceed = await OcrCaptureInstructions.showAsBottomSheet(context);
     if (proceed != true) return;
     final picked = await _picker.pickImage(source: ImageSource.camera);
-    if (picked != null) _processFile(File(picked.path));
+    if (picked != null) {
+      final bytes = await picked.readAsBytes();
+      await _processBytes(
+        fileName: picked.name,
+        rawBytes: bytes,
+      );
+    }
   }
 
   Future<void> _pickFromGallery() async {
@@ -65,7 +70,13 @@ class _OcrHomePageState extends State<OcrHomePage> {
       final proceed = await OcrCaptureInstructions.showAsBottomSheet(context);
       if (proceed != true) return;
       final picked = await _picker.pickImage(source: ImageSource.gallery);
-      if (picked != null) _processFile(File(picked.path));
+      if (picked != null) {
+        final bytes = await picked.readAsBytes();
+        await _processBytes(
+          fileName: picked.name,
+          rawBytes: bytes,
+        );
+      }
     } else {
       _pickFromFileBrowser();
     }
@@ -74,27 +85,50 @@ class _OcrHomePageState extends State<OcrHomePage> {
   Future<void> _pickFromFileBrowser() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'heic', 'tiff', 'pdf'],
+      allowedExtensions: [
+        'jpg',
+        'jpeg',
+        'png',
+        'webp',
+        'bmp',
+        'gif',
+        'heic',
+        'tiff',
+        'pdf'
+      ],
       allowMultiple: false,
     );
-    if (result != null && result.files.single.path != null) {
-      _processFile(File(result.files.single.path!));
+    if (result == null || result.files.isEmpty) return;
+
+    final pickedFile = result.files.single;
+    final bytes = pickedFile.bytes;
+    if (bytes == null) {
+      setState(() => _error = 'Failed to read selected file bytes.');
+      return;
     }
+
+    await _processBytes(
+      fileName: pickedFile.name,
+      rawBytes: bytes,
+    );
   }
 
-  bool _isPdf(File file) => file.path.toLowerCase().endsWith('.pdf');
+  bool _isPdf(String fileName) => fileName.toLowerCase().endsWith('.pdf');
 
-  Future<void> _processFile(File file) async {
-    final rawBytes = await file.readAsBytes();
+  Future<void> _processBytes({
+    required String fileName,
+    required Uint8List rawBytes,
+  }) async {
     if (!mounted) return;
 
     Uint8List imageBytes;
 
     // Handle PDF: render first page to image
-    if (_isPdf(file)) {
+    if (_isPdf(fileName)) {
       final rendered = await OcrDocumentSaver.renderPdfPage(rawBytes);
       if (rendered == null) {
-        setState(() => _error = 'Failed to render PDF. Platform may not support it.');
+        setState(() =>
+            _error = 'Failed to render PDF. Platform may not support it.');
         return;
       }
       imageBytes = rendered;
@@ -117,7 +151,7 @@ class _OcrHomePageState extends State<OcrHomePage> {
     if (croppedBytes == null) return;
 
     setState(() {
-      _imageFile = file;
+      _imageName = fileName;
       _processedBytes = croppedBytes;
       _result = null;
       _details = null;
@@ -159,8 +193,13 @@ class _OcrHomePageState extends State<OcrHomePage> {
     final Color bgColor;
 
     if (details.docType == DetectedDocType.unknown) {
-      message = '⚠️ Document type not recognized';
-      bgColor = Colors.orange;
+      if (details.rawText.trim().isNotEmpty) {
+        message = '✅ Text recognized';
+        bgColor = Colors.green;
+      } else {
+        message = '⚠️ Document type not recognized';
+        bgColor = Colors.orange;
+      }
     } else if (details.isValid) {
       message = '✅ Valid ${_docTypeLabel(details.docType)}';
       if (details.documentNumber != null) {
@@ -385,6 +424,13 @@ class _OcrHomePageState extends State<OcrHomePage> {
 
   Widget _buildValidationCard() {
     final details = _details!;
+    if (details.docType == DetectedDocType.unknown) {
+      if (details.rawText.trim().isNotEmpty) {
+        return _validationChip(
+            'Text recognized (document type not detected)', true);
+      }
+      return _validationChip('No text detected', false);
+    }
     if (details.isValid) {
       final label = details.documentNumber != null
           ? '${_docTypeLabel(_docType)} Valid: ${details.documentNumber}'
@@ -454,10 +500,9 @@ class _OcrHomePageState extends State<OcrHomePage> {
               onPressed: _loading ? null : _pickFromFileBrowser,
               icon: const Icon(Icons.folder_open),
               label: const Text('Open Image File'))),
-      if (_imageFile != null) ...[
+      if (_imageName != null) ...[
         const SizedBox(width: 12),
-        Text(_imageFile!.path.split(Platform.pathSeparator).last,
-            style: Theme.of(context).textTheme.bodySmall)
+        Text(_imageName!, style: Theme.of(context).textTheme.bodySmall)
       ],
     ]);
   }

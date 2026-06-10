@@ -7,6 +7,7 @@ A Flutter plugin for extracting text from images **and PDFs** using native on-de
 - **macOS**: Apple Vision Framework
 - **Windows**: Windows.Media.Ocr (WinRT)
 - **Linux**: Tesseract OCR
+- **Web**: Tesseract.js
 
 ## Features
 
@@ -66,6 +67,16 @@ Requires Tesseract:
 ```bash
 sudo apt install libtesseract-dev tesseract-ocr-eng libleptonica-dev
 ```
+
+### Web
+
+Add Tesseract.js script in `web/index.html`:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+```
+
+Use `readFromBytes` for uploaded image bytes on web.
 
 ## Usage
 
@@ -491,6 +502,7 @@ linux/
 | macOS    | 10.15       | Apple Vision  | ✅ | ✅ | ✅ |
 | Windows  | 10          | WinRT OCR     | ❌ | ❌ | ✅ |
 | Linux    | Any         | Tesseract OCR | ❌ | ❌ | ❌ |
+| Web      | Any         | Tesseract.js  | ❌ | ❌ | ❌ |
 
 ## Flutter Compatibility
 

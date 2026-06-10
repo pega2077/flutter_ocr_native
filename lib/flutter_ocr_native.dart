@@ -7,14 +7,17 @@ export 'src/models/ocr_result.dart';
 export 'src/models/ocr_watermark.dart';
 export 'src/models/passport_details.dart';
 export 'src/models/voter_id_details.dart';
-export 'src/ocr_reader.dart';
+export 'src/ocr_reader.dart'
+    if (dart.library.js_interop) 'src/ocr_reader_web.dart';
 export 'src/ocr_platform_interface.dart';
-export 'src/utils/ocr_document_saver.dart';
+export 'src/utils/ocr_document_saver.dart'
+    if (dart.library.js_interop) 'src/utils/ocr_document_saver_web.dart';
 export 'src/validators/document_number_validator.dart';
 export 'src/validators/document_type_detector.dart';
 export 'src/validators/ocr_validator.dart';
 export 'src/widgets/ocr_capture_instructions.dart';
 export 'src/widgets/ocr_details_card.dart';
-export 'src/widgets/ocr_document_viewer.dart';
+export 'src/widgets/ocr_document_viewer.dart'
+    if (dart.library.js_interop) 'src/widgets/ocr_document_viewer_web.dart';
 export 'src/widgets/ocr_image_cropper.dart';
 export 'src/widgets/voter_id_details_card.dart';
