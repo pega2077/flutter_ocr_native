@@ -10,6 +10,7 @@
 #endif
 
 #include <windows.h>
+#include <objbase.h>
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -23,10 +24,16 @@
 #include <gdiplus.h>
 #include <shlobj.h>
 
+#include <condition_variable>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "gdiplus.lib")
@@ -40,6 +47,103 @@ namespace streams = winrt::Windows::Storage::Streams;
 namespace globalization = winrt::Windows::Globalization;
 
 namespace {
+
+// Flutter's UI thread initializes COM as STA. cppwinrt's blocking .get() on
+// IAsyncOperation asserts !is_sta_thread(), so all WinRT work must run on a
+// dedicated MTA worker thread.
+class WinRtWorker {
+ public:
+  static WinRtWorker& Instance() {
+    static WinRtWorker worker;
+    return worker;
+  }
+
+  template <typename Func>
+  auto Run(Func&& func) -> decltype(func()) {
+    using Result = decltype(func());
+    std::packaged_task<Result()> task(std::forward<Func>(func));
+    auto future = task.get_future();
+    Post([&task]() { task(); });
+    return future.get();
+  }
+
+  ocr::OcrEngine Engine() {
+    WaitUntilReady();
+    return ocr_engine_;
+  }
+
+  // Must only be called from tasks executing on the worker thread.
+  ocr::OcrEngine ActiveEngine() const { return ocr_engine_; }
+
+ private:
+  WinRtWorker() : thread_([this] { ThreadMain(); }) {}
+
+  ~WinRtWorker() {
+    {
+      std::lock_guard lock(mutex_);
+      stopping_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  WinRtWorker(const WinRtWorker&) = delete;
+  WinRtWorker& operator=(const WinRtWorker&) = delete;
+
+  void Post(std::function<void()> work) {
+    {
+      std::lock_guard lock(mutex_);
+      tasks_.push(std::move(work));
+    }
+    cv_.notify_one();
+  }
+
+  void WaitUntilReady() {
+    std::unique_lock lock(mutex_);
+    ready_cv_.wait(lock, [this] { return engine_ready_; });
+  }
+
+  void ThreadMain() {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+
+    ocr_engine_ = ocr::OcrEngine::TryCreateFromLanguage(
+        globalization::Language(L"en-US"));
+    if (!ocr_engine_) {
+      ocr_engine_ = ocr::OcrEngine::TryCreateFromUserProfileLanguages();
+    }
+
+    {
+      std::lock_guard lock(mutex_);
+      engine_ready_ = true;
+    }
+    ready_cv_.notify_all();
+
+    while (true) {
+      std::function<void()> work;
+      {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
+        if (stopping_ && tasks_.empty()) {
+          return;
+        }
+        work = std::move(tasks_.front());
+        tasks_.pop();
+      }
+      work();
+    }
+  }
+
+  std::thread thread_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::condition_variable ready_cv_;
+  std::queue<std::function<void()>> tasks_;
+  bool stopping_ = false;
+  bool engine_ready_ = false;
+  ocr::OcrEngine ocr_engine_{nullptr};
+};
 
 class FlutterOcrNativePlugin : public flutter::Plugin {
  public:
@@ -92,7 +196,6 @@ class FlutterOcrNativePlugin : public flutter::Plugin {
   std::vector<uint8_t> DrawWatermark(const std::vector<uint8_t>& bytes,
                                       const flutter::EncodableMap& lines, int quality);
 
-  ocr::OcrEngine ocr_engine_{nullptr};
   ULONG_PTR gdiplus_token_{0};
 };
 
@@ -113,18 +216,12 @@ void FlutterOcrNativePlugin::RegisterWithRegistrar(
 }
 
 FlutterOcrNativePlugin::FlutterOcrNativePlugin() {
-  winrt::init_apartment();
+  // Ensure the WinRT worker thread (and OCR engine) are initialized early.
+  WinRtWorker::Instance().Engine();
 
   // Initialize GDI+
   Gdiplus::GdiplusStartupInput gdiplus_input;
   Gdiplus::GdiplusStartup(&gdiplus_token_, &gdiplus_input, nullptr);
-
-  // Create OCR engine for English
-  ocr_engine_ = ocr::OcrEngine::TryCreateFromLanguage(
-      globalization::Language(L"en-US"));
-  if (!ocr_engine_) {
-    ocr_engine_ = ocr::OcrEngine::TryCreateFromUserProfileLanguages();
-  }
 }
 
 FlutterOcrNativePlugin::~FlutterOcrNativePlugin() {
@@ -214,31 +311,35 @@ void FlutterOcrNativePlugin::RecognizeFromPath(
 void FlutterOcrNativePlugin::RecognizeFromBytes(
     const std::vector<uint8_t>& bytes,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  if (!ocr_engine_) {
-    result->Error("NOT_INITIALIZED", "OCR engine not available");
-    return;
-  }
-
   try {
-    auto stream = streams::InMemoryRandomAccessStream();
-    auto writer = streams::DataWriter(stream.GetOutputStreamAt(0));
-    writer.WriteBytes(winrt::array_view<const uint8_t>(bytes));
-    writer.StoreAsync().get();
-    writer.FlushAsync().get();
-    writer.DetachStream();
-    stream.Seek(0);
+    auto& worker = WinRtWorker::Instance();
+    auto response = worker.Run([&]() {
+      auto engine = worker.ActiveEngine();
+      if (!engine) {
+        throw std::runtime_error("OCR engine not available");
+      }
 
-    auto decoder = imaging::BitmapDecoder::CreateAsync(stream).get();
-    auto bitmap = decoder.GetSoftwareBitmapAsync().get();
+      auto stream = streams::InMemoryRandomAccessStream();
+      auto writer = streams::DataWriter(stream.GetOutputStreamAt(0));
+      writer.WriteBytes(winrt::array_view<const uint8_t>(bytes));
+      writer.StoreAsync().get();
+      writer.FlushAsync().get();
+      writer.DetachStream();
+      stream.Seek(0);
 
-    if (bitmap.BitmapPixelFormat() != imaging::BitmapPixelFormat::Bgra8 ||
-        bitmap.BitmapAlphaMode() != imaging::BitmapAlphaMode::Premultiplied) {
-      bitmap = imaging::SoftwareBitmap::Convert(bitmap, imaging::BitmapPixelFormat::Bgra8,
-                                                 imaging::BitmapAlphaMode::Premultiplied);
-    }
+      auto decoder = imaging::BitmapDecoder::CreateAsync(stream).get();
+      auto bitmap = decoder.GetSoftwareBitmapAsync().get();
 
-    auto ocr_result = ocr_engine_.RecognizeAsync(bitmap).get();
-    auto response = ProcessOcrResult(ocr_result, bytes);
+      if (bitmap.BitmapPixelFormat() != imaging::BitmapPixelFormat::Bgra8 ||
+          bitmap.BitmapAlphaMode() != imaging::BitmapAlphaMode::Premultiplied) {
+        bitmap = imaging::SoftwareBitmap::Convert(
+            bitmap, imaging::BitmapPixelFormat::Bgra8,
+            imaging::BitmapAlphaMode::Premultiplied);
+      }
+
+      auto ocr_result = engine.RecognizeAsync(bitmap).get();
+      return ProcessOcrResult(ocr_result, bytes);
+    });
     result->Success(flutter::EncodableValue(response));
   } catch (const winrt::hresult_error& e) {
     result->Error("RECOGNITION_FAILED", winrt::to_string(e.message()));
@@ -609,58 +710,69 @@ void FlutterOcrNativePlugin::RenderPdfPage(
     double scale,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   try {
-    auto stream = streams::InMemoryRandomAccessStream();
-    auto writer = streams::DataWriter(stream.GetOutputStreamAt(0));
-    writer.WriteBytes(winrt::array_view<const uint8_t>(bytes));
-    writer.StoreAsync().get();
-    writer.FlushAsync().get();
-    writer.DetachStream();
-    stream.Seek(0);
+    auto rendered = WinRtWorker::Instance().Run([&]() -> std::vector<uint8_t> {
+      auto stream = streams::InMemoryRandomAccessStream();
+      auto writer = streams::DataWriter(stream.GetOutputStreamAt(0));
+      writer.WriteBytes(winrt::array_view<const uint8_t>(bytes));
+      writer.StoreAsync().get();
+      writer.FlushAsync().get();
+      writer.DetachStream();
+      stream.Seek(0);
 
-    auto doc = pdf::PdfDocument::LoadFromStreamAsync(stream).get();
-    if ((uint32_t)page >= doc.PageCount()) {
-      result->Error("INVALID_ARG", "Page out of range");
-      return;
-    }
+      auto doc = pdf::PdfDocument::LoadFromStreamAsync(stream).get();
+      if ((uint32_t)page >= doc.PageCount()) {
+        throw std::runtime_error("Page out of range");
+      }
 
-    auto pdfPage = doc.GetPage(page);
-    auto pageSize = pdfPage.Size();
+      auto pdfPage = doc.GetPage(page);
+      auto pageSize = pdfPage.Size();
 
-    // Cap dimensions
-    double maxDim = 3000.0;
-    double effectiveScale = scale;
-    if (pageSize.Width * scale > maxDim || pageSize.Height * scale > maxDim) {
-      effectiveScale = (std::min)(maxDim / (double)pageSize.Width, maxDim / (double)pageSize.Height);
-    }
+      // Cap dimensions
+      double maxDim = 3000.0;
+      double effectiveScale = scale;
+      if (pageSize.Width * scale > maxDim || pageSize.Height * scale > maxDim) {
+        effectiveScale = (std::min)(maxDim / (double)pageSize.Width,
+                                    maxDim / (double)pageSize.Height);
+      }
 
-    auto renderStream = streams::InMemoryRandomAccessStream();
-    pdf::PdfPageRenderOptions options;
-    options.DestinationWidth((uint32_t)(pageSize.Width * effectiveScale));
-    options.DestinationHeight((uint32_t)(pageSize.Height * effectiveScale));
-    winrt::Windows::UI::Color white;
-    white.A = 255; white.R = 255; white.G = 255; white.B = 255;
-    options.BackgroundColor(white);
-    pdfPage.RenderToStreamAsync(renderStream, options).get();
-    pdfPage.Close();
+      auto renderStream = streams::InMemoryRandomAccessStream();
+      pdf::PdfPageRenderOptions options;
+      options.DestinationWidth((uint32_t)(pageSize.Width * effectiveScale));
+      options.DestinationHeight((uint32_t)(pageSize.Height * effectiveScale));
+      winrt::Windows::UI::Color white;
+      white.A = 255;
+      white.R = 255;
+      white.G = 255;
+      white.B = 255;
+      options.BackgroundColor(white);
+      pdfPage.RenderToStreamAsync(renderStream, options).get();
+      pdfPage.Close();
 
-    renderStream.Seek(0);
-    uint32_t size = (uint32_t)renderStream.Size();
-    auto reader = streams::DataReader(renderStream);
-    reader.LoadAsync(size).get();
-    std::vector<uint8_t> img_bytes(size);
-    reader.ReadBytes(img_bytes);
-    reader.DetachStream();
+      renderStream.Seek(0);
+      uint32_t size = (uint32_t)renderStream.Size();
+      auto reader = streams::DataReader(renderStream);
+      reader.LoadAsync(size).get();
+      std::vector<uint8_t> img_bytes(size);
+      reader.ReadBytes(img_bytes);
+      reader.DetachStream();
+      return img_bytes;
+    });
 
-    auto jpeg_bytes = CompressToJpeg(img_bytes, 85);
+    auto jpeg_bytes = CompressToJpeg(rendered, 85);
     if (jpeg_bytes.empty()) {
-      result->Success(flutter::EncodableValue(img_bytes));
+      result->Success(flutter::EncodableValue(rendered));
     } else {
       result->Success(flutter::EncodableValue(jpeg_bytes));
     }
   } catch (const winrt::hresult_error& e) {
     result->Error("PDF_RENDER_FAILED", winrt::to_string(e.message()));
   } catch (const std::exception& e) {
-    result->Error("PDF_RENDER_FAILED", e.what());
+    const std::string message = e.what();
+    if (message == "Page out of range") {
+      result->Error("INVALID_ARG", message);
+      return;
+    }
+    result->Error("PDF_RENDER_FAILED", message);
   }
 }
 
@@ -668,16 +780,19 @@ void FlutterOcrNativePlugin::GetPdfPageCount(
     const std::vector<uint8_t>& bytes,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   try {
-    auto stream = streams::InMemoryRandomAccessStream();
-    auto writer = streams::DataWriter(stream.GetOutputStreamAt(0));
-    writer.WriteBytes(winrt::array_view<const uint8_t>(bytes));
-    writer.StoreAsync().get();
-    writer.FlushAsync().get();
-    writer.DetachStream();
-    stream.Seek(0);
+    auto page_count = WinRtWorker::Instance().Run([&]() {
+      auto stream = streams::InMemoryRandomAccessStream();
+      auto writer = streams::DataWriter(stream.GetOutputStreamAt(0));
+      writer.WriteBytes(winrt::array_view<const uint8_t>(bytes));
+      writer.StoreAsync().get();
+      writer.FlushAsync().get();
+      writer.DetachStream();
+      stream.Seek(0);
 
-    auto doc = pdf::PdfDocument::LoadFromStreamAsync(stream).get();
-    result->Success(flutter::EncodableValue((int)doc.PageCount()));
+      auto doc = pdf::PdfDocument::LoadFromStreamAsync(stream).get();
+      return (int)doc.PageCount();
+    });
+    result->Success(flutter::EncodableValue(page_count));
   } catch (const winrt::hresult_error& e) {
     result->Error("PDF_READ_FAILED", winrt::to_string(e.message()));
   } catch (const std::exception& e) {

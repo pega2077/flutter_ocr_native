@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_ocr_native/flutter_ocr_native.dart';
 import 'package:image_picker/image_picker.dart';
 
+import 'picked_file_bytes.dart';
+
 void main() => runApp(const OcrExampleApp());
 
 bool get isMobile =>
@@ -97,11 +99,12 @@ class _OcrHomePageState extends State<OcrHomePage> {
         'pdf'
       ],
       allowMultiple: false,
+      withData: kIsWeb,
     );
     if (result == null || result.files.isEmpty) return;
 
     final pickedFile = result.files.single;
-    final bytes = pickedFile.bytes;
+    final bytes = await readPickedFileBytes(pickedFile);
     if (bytes == null) {
       setState(() => _error = 'Failed to read selected file bytes.');
       return;
