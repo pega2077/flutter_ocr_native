@@ -142,7 +142,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
 
             DispatchQueue.global(qos: .userInitiated).async {
                 try? originalHandler.perform([originalRequest])
-                let originalObs = originalRequest.results as? [VNRecognizedTextObservation] ?? []
+                let originalObs = originalRequest.results ?? []
                 let originalScore = originalObs.reduce(Float(0)) { sum, obs in
                     sum + obs.confidence * Float(obs.topCandidates(1).first?.string.count ?? 0)
                 }
@@ -189,7 +189,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
                     }
 
                     let request = VNRecognizeTextRequest { req, _ in
-                        let observations = req.results as? [VNRecognizedTextObservation] ?? []
+                        let observations = req.results ?? []
                         let score = observations.reduce(Float(0)) { sum, obs in
                             sum + obs.confidence * Float(obs.topCandidates(1).first?.string.count ?? 0)
                         }
@@ -409,7 +409,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            guard let observations = request.results as? [VNRecognizedTextObservation] else {
+            guard let observations = request.results else {
                 result(["text": "", "blocks": [], "isPrinted": false, "maskedImageBytes": NSNull()])
                 return
             }
@@ -621,7 +621,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            guard let faces = request.results as? [VNFaceObservation], !faces.isEmpty else {
+            guard let faces = request.results, !faces.isEmpty else {
                 result(nil)
                 return
             }

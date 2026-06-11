@@ -12,4 +12,11 @@ Pod::Spec.new do |s|
   s.platform         = :osx, '10.15'
   s.osx.deployment_target = '10.15'
   s.swift_version    = '5.0'
+  # Xcode 26+ may inject a Metal toolchain search path that lacks Swift libs; prefer the default toolchain.
+  s.pod_target_xcconfig = {
+    'TOOLCHAINS' => 'com.apple.dt.toolchain.XcodeDefault',
+  }
+  s.user_target_xcconfig = {
+    'TOOLCHAINS' => 'com.apple.dt.toolchain.XcodeDefault',
+  }
 end
