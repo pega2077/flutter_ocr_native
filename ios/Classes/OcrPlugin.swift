@@ -126,115 +126,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "INVALID_ARG", message: "imageBytes required", details: nil))
                 return
             }
-            // First apply EXIF orientation
-            let fmt = UIGraphicsImageRendererFormat()
-            fmt.scale = 1.0
-            let renderer = UIGraphicsImageRenderer(size: uiImage.size, format: fmt)
-            let normalized = renderer.image { _ in uiImage.draw(at: .zero) }
-            guard let cgBase = normalized.cgImage else {
-                result(FlutterStandardTypedData(bytes: bytes.data))
-                return
-            }
-
-            // First check if original orientation is already readable
-            let originalRequest = VNRecognizeTextRequest()
-            originalRequest.recognitionLevel = .fast
-            let originalHandler = VNImageRequestHandler(cgImage: cgBase, options: [:])
-
-            DispatchQueue.global(qos: .userInitiated).async {
-                try? originalHandler.perform([originalRequest])
-                let originalObs = originalRequest.results ?? []
-                let originalScore = originalObs.reduce(Float(0)) { sum, obs in
-                    sum + obs.confidence * Float(obs.topCandidates(1).first?.string.count ?? 0)
-                }
-
-                // If original has good readable text, keep it
-                if originalObs.count >= 2 && originalScore > 5.0 {
-                    DispatchQueue.main.async {
-                        guard let jpeg = normalized.jpegData(compressionQuality: 0.95) else {
-                            result(FlutterStandardTypedData(bytes: bytes.data))
-                            return
-                        }
-                        result(FlutterStandardTypedData(bytes: jpeg))
-                    }
-                    return
-                }
-
-                // Original not readable — try other rotations
-                let otherRotations: [Int] = [90, 180, 270]
-                var bestDegrees = 0
-                var bestScore = originalScore
-                let group = DispatchGroup()
-                let lock = NSLock()
-
-                for deg in otherRotations {
-                    group.enter()
-                    let radians = CGFloat(deg) * .pi / 180.0
-                    let w = CGFloat(cgBase.width)
-                    let h = CGFloat(cgBase.height)
-                    let newW = abs(w * cos(radians)) + abs(h * sin(radians))
-                    let newH = abs(w * sin(radians)) + abs(h * cos(radians))
-                    let colorSpace = cgBase.colorSpace ?? CGColorSpaceCreateDeviceRGB()
-                    guard let ctx = CGContext(data: nil, width: Int(newW), height: Int(newH), bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-                        group.leave()
-                        continue
-                    }
-                    ctx.translateBy(x: newW / 2, y: newH / 2)
-                    ctx.rotate(by: radians)
-                    ctx.draw(cgBase, in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h))
-                    guard let rotated = ctx.makeImage() else {
-                        group.leave()
-                        continue
-                    }
-
-                    let request = VNRecognizeTextRequest { req, _ in
-                        let observations = req.results ?? []
-                        let score = observations.reduce(Float(0)) { sum, obs in
-                            sum + obs.confidence * Float(obs.topCandidates(1).first?.string.count ?? 0)
-                        }
-                        lock.lock()
-                        if score > bestScore {
-                            bestScore = score
-                            bestDegrees = deg
-                        }
-                        lock.unlock()
-                        group.leave()
-                    }
-                    request.recognitionLevel = .fast
-                    let handler = VNImageRequestHandler(cgImage: rotated, options: [:])
-                    try? handler.perform([request])
-                }
-
-                group.wait()
-                DispatchQueue.main.async {
-                    if bestDegrees == 0 {
-                        guard let jpeg = normalized.jpegData(compressionQuality: 0.95) else {
-                            result(FlutterStandardTypedData(bytes: bytes.data))
-                            return
-                        }
-                        result(FlutterStandardTypedData(bytes: jpeg))
-                    } else {
-                        let radians = CGFloat(bestDegrees) * .pi / 180.0
-                        let w = normalized.size.width
-                        let h = normalized.size.height
-                        let newSize = CGSize(
-                            width: abs(w * cos(radians)) + abs(h * sin(radians)),
-                            height: abs(w * sin(radians)) + abs(h * cos(radians))
-                        )
-                        let r = UIGraphicsImageRenderer(size: newSize, format: fmt)
-                        let rotatedImg = r.image { ctx in
-                            ctx.cgContext.translateBy(x: newSize.width / 2, y: newSize.height / 2)
-                            ctx.cgContext.rotate(by: radians)
-                            normalized.draw(in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h))
-                        }
-                        guard let jpeg = rotatedImg.jpegData(compressionQuality: 0.95) else {
-                            result(FlutterStandardTypedData(bytes: bytes.data))
-                            return
-                        }
-                        result(FlutterStandardTypedData(bytes: jpeg))
-                    }
-                }
-            }
+            correctOrientation(uiImage: uiImage, originalBytes: bytes.data, result: result)
 
         case "setLanguage":
             guard let languageTag = args?["languageTag"] as? String, !languageTag.isEmpty else {
@@ -395,6 +287,136 @@ public class OcrPlugin: NSObject, FlutterPlugin {
         return "en-US"
     }
 
+    private func textRecognitionScore(from observations: [VNRecognizedTextObservation]) -> Float {
+        var score: Float = 0
+        for observation in observations {
+            guard let candidate = observation.topCandidates(1).first else { continue }
+            score += observation.confidence * Float(candidate.string.count)
+        }
+        return score
+    }
+
+    private func jpegData(from image: UIImage, quality: CGFloat, fallback: Data) -> FlutterStandardTypedData {
+        guard let jpeg = image.jpegData(compressionQuality: quality) else {
+            return FlutterStandardTypedData(bytes: fallback)
+        }
+        return FlutterStandardTypedData(bytes: jpeg)
+    }
+
+    private func rotateImage(_ image: UIImage, degrees: Int) -> UIImage {
+        let radians = CGFloat(degrees) * .pi / 180.0
+        let w = image.size.width
+        let h = image.size.height
+        let newSize = CGSize(
+            width: abs(w * cos(radians)) + abs(h * sin(radians)),
+            height: abs(w * sin(radians)) + abs(h * cos(radians))
+        )
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: newSize, format: fmt)
+        return renderer.image { ctx in
+            ctx.cgContext.translateBy(x: newSize.width / 2, y: newSize.height / 2)
+            ctx.cgContext.rotate(by: radians)
+            image.draw(in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h))
+        }
+    }
+
+    private func rotatedCGImage(from cgImage: CGImage, degrees: Int) -> CGImage? {
+        let radians = CGFloat(degrees) * .pi / 180.0
+        let w = CGFloat(cgImage.width)
+        let h = CGFloat(cgImage.height)
+        let newW = abs(w * cos(radians)) + abs(h * sin(radians))
+        let newH = abs(w * sin(radians)) + abs(h * cos(radians))
+        let colorSpace = cgImage.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: Int(newW),
+            height: Int(newH),
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+        ctx.translateBy(x: newW / 2, y: newH / 2)
+        ctx.rotate(by: radians)
+        ctx.draw(cgImage, in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h))
+        return ctx.makeImage()
+    }
+
+    private func correctOrientation(
+        uiImage: UIImage,
+        originalBytes: Data,
+        result: @escaping FlutterResult
+    ) {
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: uiImage.size, format: fmt)
+        let normalized = renderer.image { _ in uiImage.draw(at: .zero) }
+        guard let cgBase = normalized.cgImage else {
+            result(FlutterStandardTypedData(bytes: originalBytes))
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            let originalRequest = VNRecognizeTextRequest()
+            originalRequest.recognitionLevel = VNRequestTextRecognitionLevel.fast
+            let originalHandler = VNImageRequestHandler(cgImage: cgBase, options: [:])
+            try? originalHandler.perform([originalRequest])
+            let originalObs = (originalRequest.results as? [VNRecognizedTextObservation]) ?? []
+            let originalScore = self.textRecognitionScore(from: originalObs)
+
+            if originalObs.count >= 2 && originalScore > 5.0 {
+                DispatchQueue.main.async {
+                    result(self.jpegData(from: normalized, quality: 0.95, fallback: originalBytes))
+                }
+                return
+            }
+
+            let otherRotations: [Int] = [90, 180, 270]
+            var bestDegrees = 0
+            var bestScore = originalScore
+            let group = DispatchGroup()
+            let lock = NSLock()
+
+            for deg in otherRotations {
+                group.enter()
+                guard let rotated = self.rotatedCGImage(from: cgBase, degrees: deg) else {
+                    group.leave()
+                    continue
+                }
+
+                let request = VNRecognizeTextRequest { req, _ in
+                    let observations = (req.results as? [VNRecognizedTextObservation]) ?? []
+                    let score = self.textRecognitionScore(from: observations)
+                    lock.lock()
+                    if score > bestScore {
+                        bestScore = score
+                        bestDegrees = deg
+                    }
+                    lock.unlock()
+                    group.leave()
+                }
+                request.recognitionLevel = VNRequestTextRecognitionLevel.fast
+                let handler = VNImageRequestHandler(cgImage: rotated, options: [:])
+                try? handler.perform([request])
+            }
+
+            group.wait()
+            DispatchQueue.main.async {
+                if bestDegrees == 0 {
+                    result(self.jpegData(from: normalized, quality: 0.95, fallback: originalBytes))
+                } else {
+                    let rotatedImage = self.rotateImage(normalized, degrees: bestDegrees)
+                    result(self.jpegData(from: rotatedImage, quality: 0.95, fallback: originalBytes))
+                }
+            }
+        }
+    }
+
     private func recognizeText(from image: CGImage, result: @escaping FlutterResult) {
         let filterLatinOnly = shouldFilterLatinOnly()
         let languageTag = recognizedLanguageTag()
@@ -406,7 +428,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            guard let observations = request.results else {
+            guard let observations = request.results as? [VNRecognizedTextObservation] else {
                 result(["text": "", "blocks": [], "isPrinted": false, "maskedImageBytes": NSNull()])
                 return
             }
@@ -462,7 +484,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
             ])
         }
 
-        request.recognitionLevel = .accurate
+        request.recognitionLevel = VNRequestTextRecognitionLevel.accurate
         request.usesLanguageCorrection = true
         request.recognitionLanguages = recognitionLanguages()
 
@@ -626,53 +648,57 @@ public class OcrPlugin: NSObject, FlutterPlugin {
         return FlutterStandardTypedData(bytes: finalData)
     }
 
+    private func cropLargestFace(from image: CGImage, faces: [VNFaceObservation]) -> FlutterStandardTypedData? {
+        guard let face = faces.max(by: {
+            $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height
+        }) else {
+            return nil
+        }
+
+        let box = face.boundingBox
+        let imageWidth = CGFloat(image.width)
+        let imageHeight = CGFloat(image.height)
+
+        let faceX = box.origin.x * imageWidth
+        let faceY = (1 - box.origin.y - box.height) * imageHeight
+        let faceW = box.width * imageWidth
+        let faceH = box.height * imageHeight
+
+        let padX = faceW * 0.2
+        let padY = faceH * 0.3
+        let cropRect = CGRect(
+            x: max(faceX - padX, 0),
+            y: max(faceY - padY, 0),
+            width: min(faceW + padX * 2, imageWidth),
+            height: min(faceH + padY * 2, imageHeight)
+        )
+
+        guard let cropped = image.cropping(to: cropRect) else {
+            return nil
+        }
+
+        let uiImage = UIImage(cgImage: cropped)
+        guard let jpegData = uiImage.jpegData(compressionQuality: 0.9) else {
+            return nil
+        }
+        return FlutterStandardTypedData(bytes: jpegData)
+    }
+
     private func extractFace(from image: CGImage, result: @escaping FlutterResult) {
-        let request = VNDetectFaceRectanglesRequest { request, error in
+        let request = VNDetectFaceRectanglesRequest { [weak self] request, error in
+            guard let self = self else { return }
+
             if let error = error {
                 result(FlutterError(code: "FACE_DETECTION_FAILED", message: error.localizedDescription, details: nil))
                 return
             }
 
-            guard let faces = request.results, !faces.isEmpty else {
+            guard let faces = request.results as? [VNFaceObservation], !faces.isEmpty else {
                 result(nil)
                 return
             }
 
-            // Get the largest face
-            let face = faces.max(by: { $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height })!
-            let box = face.boundingBox
-
-            let imageWidth = CGFloat(image.width)
-            let imageHeight = CGFloat(image.height)
-
-            // Convert normalized coords to pixel coords
-            let faceX = box.origin.x * imageWidth
-            let faceY = (1 - box.origin.y - box.height) * imageHeight
-            let faceW = box.width * imageWidth
-            let faceH = box.height * imageHeight
-
-            // Add padding
-            let padX = faceW * 0.2
-            let padY = faceH * 0.3
-            let cropRect = CGRect(
-                x: max(faceX - padX, 0),
-                y: max(faceY - padY, 0),
-                width: min(faceW + padX * 2, imageWidth),
-                height: min(faceH + padY * 2, imageHeight)
-            )
-
-            guard let cropped = image.cropping(to: cropRect) else {
-                result(nil)
-                return
-            }
-
-            let uiImage = UIImage(cgImage: cropped)
-            guard let jpegData = uiImage.jpegData(compressionQuality: 0.9) else {
-                result(nil)
-                return
-            }
-
-            result(FlutterStandardTypedData(bytes: jpegData))
+            result(self.cropLargestFace(from: image, faces: faces))
         }
 
         let handler = VNImageRequestHandler(cgImage: image, options: [:])
