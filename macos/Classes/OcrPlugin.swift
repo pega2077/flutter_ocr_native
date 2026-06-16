@@ -419,7 +419,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
     private func recognizeText(from image: CGImage, result: @escaping FlutterResult) {
         let filterLatinOnly = shouldFilterLatinOnly()
         let languageTag = recognizedLanguageTag()
-        let request = VNRecognizeTextRequest { [weak self] request, error in
+        let request = VNRecognizeTextRequest { [weak self] vnRequest, error in
             guard let self = self else { return }
 
             if let error = error {
@@ -427,7 +427,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            guard let observations = request.results as? [VNRecognizedTextObservation] else {
+            guard let observations = vnRequest.results as? [VNRecognizedTextObservation] else {
                 result(["text": "", "blocks": [], "isPrinted": false, "maskedImageBytes": NSNull()])
                 return
             }
@@ -672,7 +672,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
     }
 
     private func extractFace(from image: CGImage, result: @escaping FlutterResult) {
-        let request = VNDetectFaceRectanglesRequest { [weak self] request, error in
+        let request = VNDetectFaceRectanglesRequest { [weak self] vnRequest, error in
             guard let self = self else { return }
 
             if let error = error {
@@ -680,7 +680,7 @@ public class OcrPlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            guard let faces = request.results as? [VNFaceObservation], !faces.isEmpty else {
+            guard let faces = vnRequest.results as? [VNFaceObservation], !faces.isEmpty else {
                 result(nil)
                 return
             }
